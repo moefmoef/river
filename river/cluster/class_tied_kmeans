@@ -1,0 +1,192 @@
+# BSD 3-Clause License
+# Copyright (c) River contributors.
+
+from __future__ import annotations
+
+import math
+from typing import Dict, Hashable, Optional
+
+__all__ = ["ClassTiedKMeans"]
+
+
+class ClassTiedKMeans:
+    """Online KMeans with **class-tied** clusters (exactly what you asked for).
+
+    - A *single* KMeans lives per model (e.g., per leaf in a tree), with
+      ``n_clusters == n_classes`` (ideally).
+    - A fixed mapping between classes and cluster IDs is learned on-the-fly:
+      the first time a class ``y`` is seen, it is **reserved** to an unused cluster ID.
+    - ``learn_one(x, y)`` **always updates the cluster that is tied to class ``y``**,
+      even if that cluster is not the nearest one to ``x`` (this is the key difference
+      with standard KMeans).
+    - ``predict_one(x)`` returns the class tied to the *nearest center*.
+      If the nearest center hasn't been tied to a class yet, ``None`` is returned.
+
+    Parameters
+    ----------
+    n_clusters
+        Number of clusters to maintain. Should be >= number of classes and is often set
+        equal to the number of classes.
+    init_from
+        Optionally initialize centers from another KMeans-like object (e.g., River's
+        ``cluster.KMeans``). If provided, the first ``n_clusters`` centers are copied.
+    learning_rate
+        Learning rate strategy: either ``"inverse"``, which uses a Robbins-Monro
+        schedule ``eta = 1 / count``, or ``"exp"`` for an exponential decay with
+        ``halflife``.
+    halflife
+        Halflife used when ``learning_rate="exp"``. The update step becomes
+        ``eta = 1 - 2**(-1 / halflife)``.
+
+    Notes
+    -----
+    This implementation **breaks** the standard KMeans quantization objective on purpose,
+    to satisfy the "update the class cluster even if it's not nearest" constraint.
+    Use with care: this can drift centers away from quantization optima, but it's exactly
+    the behavior requested.
+
+    Examples
+    --------
+    >>> km = ClassTiedKMeans(n_clusters=2)
+    >>> x1, y1 = {"f0": 0.0}, 0
+    >>> x2, y2 = {"f0": 1.0}, 1
+    >>> km.learn_one(x1, y1)
+    >>> km.learn_one(x2, y2)
+    >>> km.predict_one({"f0": 0.1}) in (0, 1)
+    True
+    """
+
+    def __init__(
+        self,
+        n_clusters: int,
+        *,
+        init_from: Optional[object] = None,
+        learning_rate: str = "inverse",  # "inverse" or "exp"
+        halflife: float = 0.3,
+    ):
+        if n_clusters <= 0:
+            raise ValueError("n_clusters must be positive.")
+        if learning_rate not in {"inverse", "exp"}:
+            raise ValueError('learning_rate must be one of {"inverse", "exp"}.')
+
+        self.n_clusters = int(n_clusters)
+        self.learning_rate = learning_rate
+        self.halflife = float(halflife)
+
+        # Internal state
+        self.centers: Dict[int, Dict[Hashable, float]] = {}  # cid -> center vector
+        self.counts: Dict[int, int] = {}                     # cid -> #updates
+        self.class2cid: Dict[Hashable, int] = {}             # y -> cid
+        self.cid2class: Dict[int, Hashable] = {}             # cid -> y
+
+        if init_from is not None:
+            # Best-effort center copy from river.cluster.KMeans-like objects
+            idx = 0
+            for cen in self._iter_centers_like(init_from):
+                if idx >= self.n_clusters:
+                    break
+                self.centers[idx] = dict(cen)
+                self.counts[idx] = 1
+                idx += 1
+
+    # -----------------------------
+    # public API (compatible style)
+    # -----------------------------
+
+    def predict_one(self, x: Dict[Hashable, float]) -> Optional[Hashable]:
+        """Return the class tied to the nearest center (or None if unmapped)."""
+        if not self.centers:
+            return None
+        cid = self._nearest_cid(x)
+        if cid is None:
+            return None
+        return self.cid2class.get(cid, None)
+
+    def learn_one(self, x: Dict[Hashable, float], y: Hashable) -> "ClassTiedKMeans":
+        """Update **the cluster tied to class y**, even if it's not the nearest."""
+        # Ensure this class has a reserved cluster id
+        cid = self._reserve_for_class(y, x)
+        if cid is None:
+            # no free cluster id left; you may implement a replacement policy here
+            return self
+
+        # Ensure the center exists
+        self._init_center_if_needed(cid, x)
+
+        # Update rule
+        if self.learning_rate == "inverse":
+            self.counts[cid] += 1
+            eta = 1.0 / self.counts[cid]
+        else:  # "exp"
+            # Exponential decay similar to halflife-based weighting
+            eta = 1.0 - math.pow(2.0, -1.0 / max(self.halflife, 1e-9))
+
+        c = self.centers[cid]
+        for f, xv in x.items():
+            c[f] = c.get(f, 0.0) + eta * (xv - c.get(f, 0.0))
+
+        return self
+
+    # -----------------------------
+    # helpers
+    # -----------------------------
+
+    def _reserve_for_class(self, y: Hashable, x: Dict[Hashable, float]) -> Optional[int]:
+        """Tie a free cluster id to class y (and init its center with x) if needed."""
+        if y in self.class2cid:
+            return self.class2cid[y]
+
+        # find a free cluster id
+        for cid in range(self.n_clusters):
+            if cid not in self.cid2class:
+                self.class2cid[y] = cid
+                self.cid2class[cid] = y
+                self._init_center_if_needed(cid, x)
+                return cid
+
+        return None  # no free slot
+
+    def _init_center_if_needed(self, cid: int, x: Dict[Hashable, float]) -> None:
+        if cid not in self.centers:
+            self.centers[cid] = dict(x)
+            self.counts[cid] = 0
+
+    def _nearest_cid(self, x: Dict[Hashable, float]) -> Optional[int]:
+        best_cid, best_d = None, float("inf")
+        for cid, cen in self.centers.items():
+            d2 = _euclid2(x, cen)
+            if d2 < best_d:
+                best_d = d2
+                best_cid = cid
+        return best_cid
+
+    @staticmethod
+    def _iter_centers_like(km_obj):
+        # river.cluster.KMeans compatibility: pull centers if present
+        centers = getattr(km_obj, "centers", None)
+        if isinstance(centers, dict):
+            for v in centers.values():
+                if isinstance(v, dict):
+                    yield v
+        clusters = getattr(km_obj, "clusters", None)
+        if isinstance(clusters, dict):
+            it = clusters.values()
+        elif isinstance(clusters, (list, tuple)):
+            it = clusters
+        else:
+            it = []
+        for obj in it:
+            cen = getattr(obj, "center", None)
+            if isinstance(cen, dict):
+                yield cen
+
+
+def _euclid2(x: Dict[Hashable, float], c: Dict[Hashable, float]) -> float:
+    d = 0.0
+    keys = set(x.keys()) | set(c.keys())
+    for k in keys:
+        xv = float(x.get(k, 0.0))
+        cv = float(c.get(k, 0.0))
+        dv = xv - cv
+        d += dv * dv
+    return d
